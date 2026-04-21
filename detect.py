@@ -5,13 +5,15 @@ Strategy:
   1. BackgroundSubtractorMOG2 finds moving regions each frame.
   2. Chronic-motion suppression eliminates shaking trees / flags (cells
      that fire in >50% of recent frames).
-  3. YOLO runs only on padded crops around surviving blobs — not the full frame.
-  4. Detections are mapped back to full-frame coords and ROI-filtered.
-  5. Annotated video written via ffmpeg.
+  3. ROI filter keeps only blobs on the road.
+  4. Optional --verify: runs YOLO on each blob crop to confirm it's a vehicle.
+     Without --verify, all surviving blobs are drawn as detections.
+  5. Annotated video written via cv2.VideoWriter.
 
 Usage:
     python detect.py --video raw_2026-04-05.mov
-    python detect.py --video raw_2026-04-05.mov --model yolov8m.pt --conf 0.1
+    python detect.py --video raw_2026-04-05.mov --verify             # + YOLO check
+    python detect.py --video raw_2026-04-05.mov --verify --conf 0.08 # lower threshold
 """
 
 import argparse
@@ -100,10 +102,21 @@ def main() -> None:
     ap.add_argument("--output",  default="output.mp4")
     ap.add_argument("--model",   default="yolo26n.pt")
     ap.add_argument("--roi",     default="roi.json")
-    ap.add_argument("--conf",    type=float, default=0.10)
-    ap.add_argument("--pad",     type=float, default=0.3,
-                    help="Fractional padding around each motion blob before YOLO crop")
+    ap.add_argument("--conf",    type=float, default=0.08)
+    ap.add_argument("--pad",     type=float, default=0.4,
+                    help="Fractional padding around each blob crop for YOLO")
+    ap.add_argument("--verify",  action="store_true",
+                    help="Run YOLO on each motion crop to confirm it's a vehicle")
     args = ap.parse_args()
+
+    # Load YOLO model only if verifying
+    model = keep_cls = None
+    if args.verify:
+        from ultralytics import YOLO
+        model = YOLO(args.model)
+        names = model.names or {}
+        keep_cls = None if len(names) == 1 else list(COCO_VEHICLE)
+        print(f"Verify model: {args.model}  conf={args.conf}")
 
     roi_poly = load_roi(args.roi)
     print(f"ROI: {'loaded' if roi_poly is not None else 'none'}")
@@ -158,14 +171,32 @@ def main() -> None:
                 for bx, by, bw, bh in blobs:
                     if roi_poly is not None and not in_roi(roi_poly, bx, by, bx+bw, by+bh):
                         continue
+
+                    # Optional YOLO verification: confirm the blob is a vehicle
+                    conf_score = 1.0
+                    if model is not None:
+                        pad_x = int(bw * args.pad)
+                        pad_y = int(bh * args.pad)
+                        x1c = max(0, bx - pad_x)
+                        y1c = max(0, by - pad_y)
+                        x2c = min(W, bx + bw + pad_x)
+                        y2c = min(H, by + bh + pad_y)
+                        crop = frame[y1c:y2c, x1c:x2c]
+                        if crop.size == 0:
+                            continue
+                        res = model(crop, conf=args.conf, classes=keep_cls, verbose=False)[0]
+                        if not res.boxes or len(res.boxes) == 0:
+                            continue  # YOLO sees nothing vehicle-like — skip blob
+                        conf_score = float(res.boxes.conf.max())
+
                     # Clip box to ROI bounding rect so it never visually escapes the polygon
-                    rx, ry, rw, rh = cv2.boundingRect(roi_poly)
+                    rx, ry, rw, rh = cv2.boundingRect(roi_poly) if roi_poly is not None else (0, 0, W, H)
                     fx1 = max(bx, rx)
                     fy1 = max(by, ry)
                     fx2 = min(bx + bw, rx + rw)
                     fy2 = min(by + bh, ry + rh)
                     if fx2 > fx1 and fy2 > fy1:
-                        detections.append((fx1, fy1, fx2, fy2, 1.0))
+                        detections.append((fx1, fy1, fx2, fy2, conf_score))
 
             # ── Draw ─────────────────────────────────────────────────────────
             if roi_poly is not None:
