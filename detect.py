@@ -1,5 +1,5 @@
 """
-detect.py — Motion-gated vehicle detection.
+detect.py — Motion-gated vehicle detection with tracking.
 
 Strategy:
   1. BackgroundSubtractorMOG2 finds moving regions each frame.
@@ -7,13 +7,13 @@ Strategy:
      that fire in >50% of recent frames).
   3. ROI filter keeps only blobs on the road.
   4. Optional --verify: runs YOLO on each blob crop to confirm it's a vehicle.
-     Without --verify, all surviving blobs are drawn as detections.
-  5. Annotated video written via cv2.VideoWriter.
+  5. ByteTrack assigns persistent IDs so each car is followed entry → exit.
+  6. Annotated video written via cv2.VideoWriter.
 
 Usage:
     python detect.py --video raw_2026-04-05.mov
     python detect.py --video raw_2026-04-05.mov --verify             # + YOLO check
-    python detect.py --video raw_2026-04-05.mov --verify --conf 0.08 # lower threshold
+    python detect.py --video raw_2026-04-05.mov --verify --conf 0.08
 """
 
 import argparse
@@ -22,14 +22,19 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
+import supervision as sv
 
 # COCO vehicle classes
 COCO_VEHICLE = {2, 3, 5, 7}
 
-# Annotator colors (BGR)
-_BOX   = (50, 200, 50)
-_LABEL = (0, 0, 0)
+# Track colors — cycle through distinct hues for each ID
+_PALETTE = [
+    (50, 200, 50), (50, 150, 255), (255, 100, 50),
+    (220, 50, 220), (50, 220, 220), (255, 200, 50),
+]
+
+def _track_color(tid: int) -> tuple:
+    return _PALETTE[tid % len(_PALETTE)]
 
 
 # ── ROI ───────────────────────────────────────────────────────────────────────
@@ -46,11 +51,9 @@ def load_roi(path: str) -> np.ndarray | None:
 
 
 def in_roi(poly: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> bool:
-    # Accept if any of center, bottom-center, or corners is inside the polygon.
-    # Strict centroid-only check misses boxes that straddle the ROI boundary.
     check = [
-        ((x1 + x2) // 2, (y1 + y2) // 2),  # center
-        ((x1 + x2) // 2, y2),               # bottom-center
+        ((x1 + x2) // 2, (y1 + y2) // 2),
+        ((x1 + x2) // 2, y2),
         (x1, y1), (x2, y1),
         (x1, y2), (x2, y2),
     ]
@@ -79,7 +82,6 @@ class ChronicMotionMap:
         return gx, gy
 
     def update_and_filter(self, blobs: list[tuple]) -> list[tuple]:
-        """Update counts with current blobs, return those that aren't chronic."""
         self.counts *= (self.window - 1) / self.window
         for bx, by, bw, bh in blobs:
             gx, gy = self._cell(bx + bw / 2, by + bh / 2)
@@ -88,7 +90,6 @@ class ChronicMotionMap:
         for blob in blobs:
             bx, by, bw, bh = blob
             gx, gy = self._cell(bx + bw / 2, by + bh / 2)
-            # counts converge to ~window at steady state, so normalize before comparing
             if self.counts[gy, gx] / self.window < self.rate:
                 survivors.append(blob)
         return survivors
@@ -103,13 +104,12 @@ def main() -> None:
     ap.add_argument("--model",   default="yolo26n.pt")
     ap.add_argument("--roi",     default="roi.json")
     ap.add_argument("--conf",    type=float, default=0.08)
-    ap.add_argument("--pad",     type=float, default=0.4,
-                    help="Fractional padding around each blob crop for YOLO")
+    ap.add_argument("--pad",     type=float, default=0.4)
     ap.add_argument("--verify",  action="store_true",
                     help="Run YOLO on each motion crop to confirm it's a vehicle")
     args = ap.parse_args()
 
-    # Load YOLO model only if verifying
+    # YOLO model — only loaded if verifying
     model = keep_cls = None
     if args.verify:
         from ultralytics import YOLO
@@ -120,25 +120,28 @@ def main() -> None:
 
     roi_poly = load_roi(args.roi)
     print(f"ROI: {'loaded' if roi_poly is not None else 'none'}")
+    roi_rect = cv2.boundingRect(roi_poly) if roi_poly is not None else None  # (x,y,w,h)
 
-    cap  = cv2.VideoCapture(args.video)
-    fps  = cap.get(cv2.CAP_PROP_FPS)
-    W    = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H    = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap   = cv2.VideoCapture(args.video)
+    fps   = cap.get(cv2.CAP_PROP_FPS)
+    W     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"Video: {W}×{H} @ {fps:.1f} fps  ({total} frames)")
 
-    fgbg         = cv2.createBackgroundSubtractorMOG2(history=200, varThreshold=40, detectShadows=False)
-    open_k       = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    dilate_k     = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    chronic_map  = ChronicMotionMap(W, H)
-    img_area     = W * H
+    fgbg        = cv2.createBackgroundSubtractorMOG2(history=200, varThreshold=40, detectShadows=False)
+    open_k      = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    dilate_k    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    chronic_map = ChronicMotionMap(W, H)
+    tracker     = sv.ByteTrack(frame_rate=int(fps))
+    trace_ann   = sv.TraceAnnotator(thickness=2, trace_length=int(fps * 3))
+    img_area    = W * H
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(args.output, fourcc, fps, (W, H))
 
     frame_idx = 0
-    warmup    = 200  # frames before motion recovery kicks in
+    warmup    = 200
 
     try:
         while cap.isOpened():
@@ -152,65 +155,85 @@ def main() -> None:
             fg = cv2.dilate(fg, dilate_k, iterations=2)
             contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-            # Collect car-sized blobs
             raw_blobs = []
             for cnt in contours:
                 area = cv2.contourArea(cnt)
                 if area < img_area * 0.0008 or area > img_area * 0.08:
                     continue
-                raw_blobs.append(cv2.boundingRect(cnt))  # (x, y, w, h)
+                raw_blobs.append(cv2.boundingRect(cnt))
 
-            # Chronic-motion suppression (shaking trees)
             blobs = chronic_map.update_and_filter(raw_blobs)
 
-            # ── Motion blobs are the detections — no YOLO needed ─────────────
-            ann = frame.copy()
-            detections = []
+            # ── Build detections ──────────────────────────────────────────────
+            boxes, confs = [], []
 
             if frame_idx >= warmup:
                 for bx, by, bw, bh in blobs:
                     if roi_poly is not None and not in_roi(roi_poly, bx, by, bx+bw, by+bh):
                         continue
 
-                    # Optional YOLO verification: confirm the blob is a vehicle
                     conf_score = 1.0
                     if model is not None:
                         pad_x = int(bw * args.pad)
                         pad_y = int(bh * args.pad)
-                        x1c = max(0, bx - pad_x)
-                        y1c = max(0, by - pad_y)
-                        x2c = min(W, bx + bw + pad_x)
-                        y2c = min(H, by + bh + pad_y)
+                        x1c = max(0, bx - pad_x);  y1c = max(0, by - pad_y)
+                        x2c = min(W, bx+bw+pad_x); y2c = min(H, by+bh+pad_y)
                         crop = frame[y1c:y2c, x1c:x2c]
                         if crop.size == 0:
                             continue
                         res = model(crop, conf=args.conf, classes=keep_cls, verbose=False)[0]
                         if not res.boxes or len(res.boxes) == 0:
-                            continue  # YOLO sees nothing vehicle-like — skip blob
+                            continue
                         conf_score = float(res.boxes.conf.max())
 
-                    # Clip box to ROI bounding rect so it never visually escapes the polygon
-                    rx, ry, rw, rh = cv2.boundingRect(roi_poly) if roi_poly is not None else (0, 0, W, H)
-                    fx1 = max(bx, rx)
-                    fy1 = max(by, ry)
-                    fx2 = min(bx + bw, rx + rw)
-                    fy2 = min(by + bh, ry + rh)
+                    # Clip to ROI bounding rect
+                    if roi_rect is not None:
+                        rx, ry, rw, rh = roi_rect
+                        fx1, fy1 = max(bx, rx),      max(by, ry)
+                        fx2, fy2 = min(bx+bw, rx+rw), min(by+bh, ry+rh)
+                    else:
+                        fx1, fy1, fx2, fy2 = bx, by, bx+bw, by+bh
+
                     if fx2 > fx1 and fy2 > fy1:
-                        detections.append((fx1, fy1, fx2, fy2, conf_score))
+                        boxes.append([fx1, fy1, fx2, fy2])
+                        confs.append(conf_score)
+
+            # ── ByteTrack ─────────────────────────────────────────────────────
+            if boxes:
+                dets = sv.Detections(
+                    xyxy=np.array(boxes, dtype=float),
+                    confidence=np.array(confs, dtype=float),
+                    class_id=np.zeros(len(boxes), dtype=int),
+                )
+                dets = tracker.update_with_detections(dets)
+            else:
+                dets = sv.Detections.empty()
 
             # ── Draw ─────────────────────────────────────────────────────────
+            ann = frame.copy()
+
             if roi_poly is not None:
                 cv2.polylines(ann, [roi_poly], True, (0, 220, 120), 2)
 
-            for fx1, fy1, fx2, fy2, conf in detections:
-                cv2.rectangle(ann, (fx1, fy1), (fx2, fy2), _BOX, 2)
-                lbl = f"{conf:.2f}"
-                (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-                cv2.rectangle(ann, (fx1, fy1 - th - 6), (fx1 + tw + 4, fy1), _BOX, -1)
-                cv2.putText(ann, lbl, (fx1 + 2, fy1 - 3),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+            # Motion traces
+            if len(dets) > 0:
+                ann = trace_ann.annotate(ann, dets)
 
-            status = f"frame {frame_idx}  |  {len(detections)} vehicle(s)  |  {len(blobs)} motion blobs"
+            # Boxes + IDs
+            tids = dets.tracker_id if dets.tracker_id is not None else []
+            for xyxy, tid in zip(dets.xyxy, tids):
+                if tid is None:
+                    continue
+                x1, y1, x2, y2 = xyxy.astype(int)
+                col = _track_color(int(tid))
+                cv2.rectangle(ann, (x1, y1), (x2, y2), col, 2)
+                lbl = f"#{tid}"
+                (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+                cv2.rectangle(ann, (x1, y1 - th - 8), (x1 + tw + 4, y1), col, -1)
+                cv2.putText(ann, lbl, (x1 + 2, y1 - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+            status = f"frame {frame_idx}  |  {len(dets)} tracked  |  {len(blobs)} blobs"
             cv2.putText(ann, status, (10, H - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
             cv2.putText(ann, status, (10, H - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
@@ -225,31 +248,7 @@ def main() -> None:
         writer.release()
 
     print(f"\nOutput: {args.output}")
-
-
-def _nms(dets: list[tuple], iou_thresh: float = 0.4) -> list[tuple]:
-    """Simple greedy NMS to remove duplicate boxes from overlapping crops."""
-    if not dets:
-        return []
-    dets = sorted(dets, key=lambda d: d[4], reverse=True)
-    kept = []
-    for d in dets:
-        x1, y1, x2, y2, _ = d
-        duplicate = False
-        for k in kept:
-            kx1, ky1, kx2, ky2, _ = k
-            ix1, iy1 = max(x1, kx1), max(y1, ky1)
-            ix2, iy2 = min(x2, kx2), min(y2, ky2)
-            if ix2 <= ix1 or iy2 <= iy1:
-                continue
-            inter = (ix2 - ix1) * (iy2 - iy1)
-            union = (x2-x1)*(y2-y1) + (kx2-kx1)*(ky2-ky1) - inter
-            if union > 0 and inter / union > iou_thresh:
-                duplicate = True
-                break
-        if not duplicate:
-            kept.append(d)
-    return kept
+    print(f"Tracks seen: {len(tracker.lost_tracks) + len(tracker.tracked_tracks)}")
 
 
 if __name__ == "__main__":
